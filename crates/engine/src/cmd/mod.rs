@@ -79,6 +79,7 @@ pub use component_link::resolve_design_links;
 mod config;
 mod design_link;
 mod file;
+pub use file::PreparedAccountSave;
 mod frame;
 mod frame_end_cap;
 pub(crate) mod inspect;
