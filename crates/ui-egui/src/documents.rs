@@ -1103,6 +1103,9 @@ pub fn saved(app: &mut SolveApp, p: &Value) -> Result<Value, String> {
 /// takes Units of new designs (#1205): a launch starts on that empty design, so returning
 /// here used to leave it in millimetres.
 pub fn new_design(app: &mut SolveApp) {
+    if app.ask_account_design(crate::AccountDesignRequest::New) {
+        return;
+    }
     if app.file_picker_busy() {
         return;
     }
@@ -1121,6 +1124,9 @@ pub fn new_design(app: &mut SolveApp) {
 /// Create a new tab directly; the File view chooses units before using [`new_design`].
 /// An untouched blank launch design is reused.
 pub fn new_tab(app: &mut SolveApp) {
+    if app.ask_account_design(crate::AccountDesignRequest::New) {
+        return;
+    }
     if app.file_picker_busy() {
         return;
     }
@@ -1199,6 +1205,9 @@ pub(crate) fn close_clean(app: &mut SolveApp, p: &Value) -> Result<Value, String
 
 /// Close tab `i`: asks first when it has unsaved changes (`force`: close anyway).
 pub fn close(app: &mut SolveApp, i: usize, force: bool) {
+    if app.ask_account_design(crate::AccountDesignRequest::Close) {
+        return;
+    }
     if app.docs.group.is_some() || app.file_picker_busy() {
         return;
     }
@@ -1333,6 +1342,9 @@ fn batch_step(app: &mut SolveApp) {
 /// Quit this window: confirm its unsaved designs, then set `app.quit_requested` for the host.
 /// Cancel, or a Save that didn't save, stays open.
 pub fn request_quit(app: &mut SolveApp) {
+    if app.ask_account_design(crate::AccountDesignRequest::Close) {
+        return;
+    }
     if app.file_picker_busy() {
         return;
     }

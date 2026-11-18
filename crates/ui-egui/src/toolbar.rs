@@ -444,11 +444,7 @@ impl FileAction {
         match self {
             Self::New => crate::documents::new_design(app),
             Self::NewDrawing => new_drawing(app),
-            Self::Open => app.pick_open(|app, path| {
-                if let Some(path) = path {
-                    app.open_chosen_file(&path);
-                }
-            }),
+            Self::Open => app.pick_open_file(),
             Self::Save => save(app),
             Self::SaveAs => save_as(app),
             Self::Undo => drop(app.run("edit.undo", json!({}))),
@@ -677,6 +673,9 @@ pub fn save(app: &mut SolveApp) {
         app.tree.capture_prompt = Some(crate::browser::SAVE.into());
         return;
     }
+    if app.ask_account_design(crate::AccountDesignRequest::Save) {
+        return;
+    }
     if app.session.path.is_some() {
         // Read-only, or changed on disk since it was opened: Save As, or a question, instead.
         if crate::open_elsewhere::check_save(app) {
@@ -710,7 +709,14 @@ pub(crate) fn save_as_named(app: &mut SolveApp, name: &str, extension: &str) {
         app.tree.capture_prompt = Some(crate::browser::save_as_question(name, extension));
         return;
     }
+    if app.account_design.is_some() && extension != solidcraft_engine::io::DESIGN_EXT {
+        app.set_status("Use the native design format for WebOS account Save As.", true);
+        return;
+    }
     let name = format!("{name}.{extension}");
+    if app.ask_account_design(crate::AccountDesignRequest::SaveAs(name.clone())) {
+        return;
+    }
     app.pick_save(&name, &[solidcraft_engine::io::DESIGN_EXT, "json"], |app, path| {
         // A save under way answers a closing tab when it ends.
         if let Some(path) = path
@@ -2718,16 +2724,10 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
         if mods.command {
             match k {
                 // An editing embed's host has its own New, Open, Save, Close and settings.
-                Key::N | Key::O | Key::S | Key::W | Key::Comma if app.embed_editor => {}
+                Key::N | Key::O | Key::S | Key::W | Key::Comma if app.embed_editor && app.account_design.is_none() => {}
                 Key::N => crate::documents::new_design(app),
                 Key::Comma => crate::prefs::open_at(app, 0),
-                Key::O => {
-                    app.pick_open(|app, path| {
-                        if let Some(path) = path {
-                            app.open_chosen_file(&path);
-                        }
-                    });
-                }
+                Key::O => app.pick_open_file(),
                 // Select All's key (Ctrl+A by default) works on the drawing's sheet.
                 _ if !shown && !(drawing_history && matches!(k, Key::Z | Key::Y)) => {
                     let key = crate::keymap::key_name(k, mods);
@@ -2931,6 +2931,42 @@ mod header_report_tests {
         h.step(&json!({"key":"Escape"})).unwrap();
         assert!(h.app.params.is_none(), "the next Escape still closes Parameters");
         assert_eq!(before, (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.selection.clone()));
+    }
+
+    #[test]
+    fn account_file_controls_leave_the_native_design_until_the_host_responds() {
+        use crate::AccountDesignRequest;
+        use std::{cell::RefCell, rc::Rc};
+
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        let uid = h.app.session.uid;
+        let name = format!("{}.sc", h.app.session.save_as_name());
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let received = requests.clone();
+        h.app.account_design = Some(Box::new(move |request| {
+            received.borrow_mut().push(request);
+            Ok(())
+        }));
+        for action in [FileAction::New, FileAction::Open, FileAction::Save, FileAction::SaveAs] {
+            action.run(&mut h.app);
+        }
+        let tab = h.app.docs.active;
+        crate::documents::close(&mut h.app, tab, false);
+        assert_eq!(
+            *requests.borrow(),
+            [
+                AccountDesignRequest::New,
+                AccountDesignRequest::Open(None),
+                AccountDesignRequest::Save,
+                AccountDesignRequest::SaveAs(name),
+                AccountDesignRequest::Close,
+            ]
+        );
+        assert!(h.app.run("file.save", json!({"path":"Documents/Other.sc"})).is_err());
+        assert_eq!(h.app.session.uid, uid);
+        assert!(h.app.session.is_dirty() && h.app.session.path.is_none());
     }
 
     #[test]

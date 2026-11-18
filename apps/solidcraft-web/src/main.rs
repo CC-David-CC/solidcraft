@@ -8,6 +8,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
+mod account;
+#[cfg(target_arch = "wasm32")]
+mod account_port;
+#[cfg(target_arch = "wasm32")]
 mod api;
 #[cfg(any(target_arch = "wasm32", test))]
 mod channel;
@@ -54,6 +58,7 @@ struct Launch {
     embed: bool,
     /// `?embed=editor` (#8517): an editing embed in a host page that keeps the files itself.
     editor: bool,
+    account: bool,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -66,8 +71,13 @@ impl Launch {
                 "open" if launch.open.is_none() => launch.open = Some(value.into_owned()),
                 "embed" if value == "editor" => launch.editor = true,
                 "embed" => embed = true,
+                "host" if value == "webos-account" => launch.account = true,
                 _ => {}
             }
+        }
+        if launch.account {
+            launch.open = None;
+            launch.editor = true;
         }
         launch.embed = embed && launch.open.is_some() && !launch.editor;
         launch
@@ -200,6 +210,8 @@ mod web {
     use solidcraft_ui_egui::{Services, SolveApp, ui_kit};
     use wasm_bindgen::JsCast as _;
 
+    use crate::account::{self, AccountView};
+    use crate::account_port::AccountPort;
     use crate::api::Api;
     use crate::disk::{self, SaveTarget};
     use crate::files::{self, Files, Intent};
@@ -369,7 +381,8 @@ mod web {
         launch: crate::Launch,
         linked: crate::linked::Download,
         full_url: Option<String>,
-        api: Api,
+        api: Option<Api>,
+        account: Option<AccountView>,
         files: Rc<Files>,
         /// When the last autosave was (seconds), and the revision it holds (none stored: `None`).
         autosaved_at: f64,
@@ -1195,12 +1208,25 @@ mod web {
 
     impl eframe::App for Shell {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if let Some(account) = &mut self.account {
+                account.poll(&mut self.app);
+                if account.suspended() {
+                    return;
+                }
+            }
             // First: a language another tab chose fetches its font this frame.
             self.load_other_tabs_prefs();
             self.tick_font(ctx);
             self.fetch_drawing_fonts(ctx);
             self.app.logic(ctx);
-            self.api.poll();
+            if let Some(account) = &mut self.account
+                && let Err(error) = account.publish_state(&self.app)
+            {
+                self.app.set_status(error, true);
+            }
+            if let Some(api) = &self.api {
+                api.poll();
+            }
             self.space_mouse.logic(&mut self.app, ctx);
             self.files_tick(ctx);
             UNSAVED.with(|u| u.set(self.asks_before_unload()));
@@ -1225,6 +1251,9 @@ mod web {
             self.app.raw_input_hook_with_taps(ctx, raw, taps);
         }
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            if self.account.as_ref().is_some_and(AccountView::suspended) {
+                return;
+            }
             self.linked.tick(&mut self.app, ui.ctx());
             self.restored();
             UNSAVED.with(|u| u.set(self.asks_before_unload()));
@@ -1342,6 +1371,31 @@ mod web {
                 log::error!("missing <canvas id=\"{CANVAS_ID}\">");
                 return;
             };
+            let port = if launch.account {
+                match AccountPort::connect() {
+                    Ok(port) => Some(port),
+                    Err(error) => {
+                        if let Some(status) = document.get_element_by_id(LOADING_ID) {
+                            status.set_text_content(Some(&error));
+                        }
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let (session, identity) = if let Some(port) = &port {
+                match account::open(port).await {
+                    Ok((session, identity)) => (session, Some(identity)),
+                    Err(error) => {
+                        port.startup_failed(&error);
+                        return;
+                    }
+                }
+            } else {
+                (Session::default(), None)
+            };
+            let app_port = port.clone();
             // The window's pass (egui's) has no depth buffer: the scene has its own
             // (`install_viewport`).
             let mut options = eframe::WebOptions { depth_buffer: 0, ..Default::default() };
@@ -1413,8 +1467,20 @@ mod web {
                         }};
                         // Thumbnails of saves and start-page cards.
                         solidcraft_ui_egui::gpu::install_cpu_picture_renderer();
-                        let (sender, receiver) = std::sync::mpsc::channel();
-                        let mut app = SolveApp::new(Session::default(), services).with_control(receiver);
+                        let mut app = SolveApp::new(session, services);
+                        let account = app_port.map(|port| {
+                            port.wake_on(cc.egui_ctx.clone());
+                            let view = AccountView::new(port);
+                            app.account_design = Some(view.design_service());
+                            view
+                        });
+                        let api = if launch.account {
+                            None
+                        } else {
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            app = app.with_control(receiver);
+                            Some(Api::install(sender, cc.egui_ctx.clone()).map_err(|e| format!("SolidCraft browser API: {e:?}"))?)
+                        };
                         app.embedded = launch.embed;
                         app.embed_editor = launch.editor;
                         // Listening before reading: settings another tab writes from now on are
@@ -1429,14 +1495,14 @@ mod web {
                         if let Some(rs) = &cc.wgpu_render_state {
                             install_viewport(&mut app, rs);
                         }
-                        if launch.open.is_none() && crate::query_flag(&query(), "sample") {
+                        if !launch.account && launch.open.is_none() && crate::query_flag(&query(), "sample") {
                             if let Err(e) = app.session.run_script(&solidcraft_engine::sample::script()) {
                                 app.set_status(format!("sample: {e}"), true);
                             }
                             app.session.doc_mut().name = "Sample Plate".into();
                             app.session.mark_saved();
                         }
-                        if launch.open.is_none() && !crate::query_flag(&query(), "sample") {
+                        if !launch.account && launch.open.is_none() && !crate::query_flag(&query(), "sample") {
                             // The empty design takes Units of new designs (#1205). The sample
                             // part is built in millimetres and is left that way.
                             solidcraft_ui_egui::prefs::apply_new_design(&mut app);
@@ -1446,7 +1512,6 @@ mod web {
                             }
                         }
                         let mouse_buttons = crate::mouse_buttons::install(&window, &mouse_canvas, &cc.egui_ctx);
-                        let api = Api::install(sender, cc.egui_ctx.clone()).map_err(|e| format!("SolidCraft browser API: {e:?}"))?;
                         let font_language = app.preferences.language.clone();
                         let linked = crate::linked::Download::start(launch.open.as_deref(), &cc.egui_ctx);
                         let full_url = window.location().href().ok().and_then(|value| url::Url::parse(&value).ok()).map(|url| launch.full_app_url(url));
@@ -1456,6 +1521,7 @@ mod web {
                             linked,
                             full_url,
                             api,
+                            account,
                             files,
                             autosaved_at: f64::NEG_INFINITY,
                             autosaved: None,
@@ -1485,6 +1551,17 @@ mod web {
                     }),
                 )
                 .await;
+            if let Some(port) = &port {
+                match (&result, identity) {
+                    (Ok(()), Some(identity)) => {
+                        if let Err(error) = port.publish("started", identity, None) {
+                            port.startup_failed(&error);
+                        }
+                    }
+                    (Err(error), _) => port.startup_failed(&format!("{error:?}")),
+                    _ => {}
+                }
+            }
             if result.is_ok()
                 && crate::Launch::parse(&query()).persists()
                 && let Some(window) = web_sys::window()
@@ -1564,6 +1641,14 @@ mod tests {
         assert!(!session.is_dirty(), "a linked design is not unsaved work, so nothing is autosaved for it");
         session.doc_mut().name = "arm 2".into();
         assert!(session.is_dirty(), "an edit makes it unsaved");
+    }
+
+    #[test]
+    fn webos_account_launch_is_isolated_from_standalone_editor_and_url_open() {
+        let account = Launch::parse("?host=webos-account&embed&open=/relative/plate.sc");
+        assert!(account.account && account.editor && !account.embed);
+        assert!(account.open.is_none() && !account.persists());
+        assert!(!Launch::parse("?other=webos-account").account);
     }
 
     #[test]

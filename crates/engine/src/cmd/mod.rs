@@ -104,6 +104,7 @@ pub use component_link::resolve_design_links;
 mod config;
 mod design_link;
 mod file;
+pub use file::PreparedAccountSave;
 mod file_library;
 pub(crate) use file_library::uses_file as file_library_uses_file;
 mod frame;

@@ -509,6 +509,18 @@ impl Default for UiState {
     }
 }
 
+/// File actions belonging to the enclosing WebOS account window.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccountDesignRequest {
+    New,
+    Open(Option<String>),
+    Save,
+    SaveAs(String),
+    Close,
+}
+
+pub type AccountDesignFn = Box<dyn Fn(AccountDesignRequest) -> Result<(), String>>;
+
 /// Host services injected by the app so this crate stays portable.
 #[derive(Default)]
 pub struct Services {
@@ -640,6 +652,7 @@ pub struct SolveApp {
     /// ribbon, browser, timeline and properties stay, and the host reads and replaces the
     /// design through `document.export` / `document.import`.
     pub embed_editor: bool,
+    pub account_design: Option<AccountDesignFn>,
     pub session: Session,
     pub ui: UiState,
     pub(crate) shell: shell::State,
@@ -1180,6 +1193,7 @@ impl SolveApp {
             flat_view: Default::default(),
             embedded: false,
             embed_editor: false,
+            account_design: None,
             home: home::HomeState::default(),
             library: library::LibraryState::default(),
             space_mouse: Default::default(),
@@ -1542,11 +1556,22 @@ impl SolveApp {
         self
     }
 
+    pub(crate) fn ask_account_design(&mut self, request: AccountDesignRequest) -> bool {
+        let Some(host) = self.account_design.as_ref() else { return false };
+        if let Err(error) = host(request) {
+            self.set_status(error, true);
+        }
+        true
+    }
+
     /// Run a command programmatically (JSON parameters, no dialogs).
     pub fn run(&mut self, id: &str, mut params: Value) -> Result<Value, String> {
         // The rules below name registered ids; a command spelled in another case is the same
         // command (the engine runs it), so it meets the same rules.
         let id = solidcraft_engine::find_command(id).map_or(id, |spec| spec.id);
+        if self.account_design.is_some() && matches!(id, "file.new" | "doc.open" | "doc.recover" | "file.save" | "file.save_as" | "document.import") {
+            return Err("Use the WebOS account window for design file operations.".into());
+        }
         crate::plugins::sync_policy(self);
         if plugins::busy(self) && matches!(id.to_ascii_lowercase().as_str(), "plugin.install" | "plugin.remove") {
             return Err(self.tr("prefs.plugin_busy").into());
@@ -2140,6 +2165,15 @@ impl SolveApp {
     }
 
     fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool, opener: Option<egui::Rect>, section_edit: bool) {
+        if self.account_design.is_some() {
+            match id {
+                "file.new" => return documents::new_design(self),
+                "doc.open" => return self.pick_open_file(),
+                "file.save" => return toolbar::save(self),
+                "file.save_as" => return toolbar::save_as(self),
+                _ => {}
+            }
+        }
         // A tool can be started outside the frame's scope (a direct `start`, a shortcut in
         // `logic`): build its hint in the user's language, not the thread default.
         let _language = solidcraft_ui_text::scope(&self.preferences.language);
@@ -3417,6 +3451,9 @@ impl SolveApp {
 
     /// Ask for a file to open: a design, a CAD or mesh file, or a KiCad board.
     pub fn pick_open_file(&mut self) {
+        if self.ask_account_design(AccountDesignRequest::Open(None)) {
+            return;
+        }
         self.pick_open(|app, path| {
             if let Some(path) = path {
                 app.open_chosen_file(&path);
@@ -3426,6 +3463,9 @@ impl SolveApp {
 
     /// Open a chosen file: a KiCad board asks for its import options first, anything else opens.
     pub fn open_chosen_file(&mut self, path: &str) {
+        if self.ask_account_design(AccountDesignRequest::Open(Some(path.into()))) {
+            return;
+        }
         if solidcraft_engine::io::is_kicad_path(path) {
             kicad_import_dialog::open(self, path);
         } else {
@@ -4203,7 +4243,7 @@ impl SolveApp {
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
         timeline::tick_playback(self, ui.ctx());
-        if !self.embedded && !self.embed_editor {
+        if !self.embedded && (!self.embed_editor || self.account_design.is_some()) {
             toolbar::app_bar(self, ui);
         }
         issue_report::CadInput::block(self, ui, report_input);

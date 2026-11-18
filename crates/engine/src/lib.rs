@@ -643,6 +643,7 @@ pub struct Session {
     /// Interactive loaders may show it provisionally; it never becomes model state.
     pub open_preview: Option<Box<dyn Fn(solidcraft_io::DesignPreview) + Send + Sync>>,
     saved: Arc<Document>,
+    save_generation: u64,
     /// Messages for the command line / log.
     pub log: Vec<String>,
     /// Increments on every document change (views use it to refresh).
@@ -1063,6 +1064,7 @@ impl Session {
             stop: Default::default(),
             is_copy: false,
             saved: doc.clone(),
+            save_generation: 0,
             doc,
             model,
             undo: Vec::new(),
@@ -1309,6 +1311,7 @@ impl Session {
 
     pub fn mark_saved(&mut self) {
         self.forget_dirty_answer();
+        self.save_generation = self.save_generation.wrapping_add(1);
         self.saved = self.doc.clone();
         self.saved_visibility = self.visibility.clone();
     }
@@ -2718,6 +2721,7 @@ impl Session {
             user_named: self.user_named,
             open_preview: None,
             saved: self.saved.clone(),
+            save_generation: self.save_generation,
             log: Vec::new(),
             revision: self.revision,
             visibility_revision: self.visibility_revision,

@@ -1797,28 +1797,7 @@ fn write_bytes(
             notes.push(format!("Saved without a signature, because it could not be signed: {why}"));
         }
     }
-    let bytes = if let Some(bytes) = signed_bytes {
-        bytes
-    } else if !chain.records.is_empty() {
-        // A save without a key keeps the history it opened with, so the newest record is reported
-        // as covering an earlier version instead of the chain being destroyed.
-        if format != "container" {
-            match format {
-                "json" => solidcraft_io::write_design(&s.design_at(Some(path))),
-                _ => return Err(bad("file.save", "format must be container or json")),
-            }
-        } else {
-            let save =
-                solidcraft_io::ProvenanceSave { source: None, chain: &chain, author: None, tool: Some("SolidCraft"), note: None, created: None };
-            s.design_container_signed(Some(path), compression, preview, cache, &save).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
-        }
-    } else {
-        match format {
-            "container" => s.design_container_at(Some(path), compression, preview, cache)?,
-            "json" => solidcraft_io::write_design(&s.design_at(Some(path))),
-            _ => return Err(bad("file.save", "format must be container or json")),
-        }
-    };
+    let bytes = if let Some(bytes) = signed_bytes { bytes } else { encode_unsigned_design(s, path, format, compression, preview, cache)? };
     let cache_not_saved = missing_save_cache(s, format, cache, &bytes);
     // Cancelled while the design was being prepared (a watched save): nothing is written.
     if solidcraft_kernel::watch::current().is_some_and(|w| w.cancelled()) {
@@ -1870,6 +1849,172 @@ fn write_bytes(
         out.warnings.get_or_insert_with(Vec::new).extend(notes);
     }
     serde_json::to_value(out).map_err(|e| bad("file.save", e.to_string()))
+}
+
+fn encode_unsigned_design(
+    s: &Session,
+    path: &str,
+    format: &str,
+    compression: solidcraft_io::DesignCompression,
+    preview: bool,
+    cache: bool,
+) -> Result<Vec<u8>> {
+    let bytes = if let Some(chain) = s.provenance_chain.as_ref().filter(|chain| !chain.records.is_empty()) {
+        // A save without a key keeps the history it opened with, so the newest record is reported
+        // as covering an earlier version instead of the chain being destroyed.
+        if format != "container" {
+            match format {
+                "json" => solidcraft_io::write_design(&s.design_at(Some(path))),
+                _ => return Err(bad("file.save", "format must be container or json")),
+            }
+        } else {
+            let save = solidcraft_io::ProvenanceSave { source: None, chain, author: None, tool: Some("SolidCraft"), note: None, created: None };
+            s.design_container_signed(Some(path), compression, preview, cache, &save).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
+        }
+    } else {
+        match format {
+            "container" => s.design_container_at(Some(path), compression, preview, cache)?,
+            "json" => solidcraft_io::write_design(&s.design_at(Some(path))),
+            _ => return Err(bad("file.save", "format must be container or json")),
+        }
+    };
+    Ok(bytes)
+}
+
+const ACCOUNT_DESIGN_BYTES: usize = 128 << 20;
+
+fn account_design_path(path: &str, command: &str) -> Result<()> {
+    if path.len() > 2048
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || path.chars().any(|ch| ch == '\\' || ch.is_control())
+        || !solidcraft_io::is_design_container_path(std::path::Path::new(path))
+    {
+        return Err(bad(command, "Choose a native account design file."));
+    }
+    Ok(())
+}
+
+fn account_design_size(bytes: &[u8], command: &str) -> Result<()> {
+    if bytes.is_empty() || bytes.len() > ACCOUNT_DESIGN_BYTES {
+        return Err(bad(command, "The native design must contain data and fit the WebOS account file limit."));
+    }
+    Ok(())
+}
+
+fn account_design_links(design: &Document, command: &str) -> Result<()> {
+    if !design.links.is_empty() {
+        return Err(bad(command, "Use a self-contained design. This WebOS window cannot resolve external component links."));
+    }
+    Ok(())
+}
+
+/// The exact native design captured for an account save.
+pub struct PreparedAccountSave {
+    document: u64,
+    save_generation: u64,
+    prior_path: Option<String>,
+    prior_name: String,
+    prior_saved: std::sync::Arc<Document>,
+    destination: String,
+    design: std::sync::Arc<Document>,
+    visibility: crate::Visibility,
+    provenance_chain: Option<solidcraft_io::ProvenanceChain>,
+}
+
+impl Session {
+    /// Capture a native container without writing or changing this design's saved state.
+    pub fn prepare_account_save(&self, path: &str) -> Result<(PreparedAccountSave, Vec<u8>)> {
+        account_design_path(path, "file.save")?;
+        account_design_links(&self.doc, "file.save")?;
+        if self.moved_uncaptured() {
+            return Err(bad("file.save", "Capture or revert moved components before saving."));
+        }
+        if self.read_only && self.path.as_deref() == Some(path) {
+            return Err(bad("file.save", "The design is read-only. Save it under a new account file name."));
+        }
+        if self.doc.newer_file.is_some() && !solidcraft_doc::newer_file::not_kept(&self.doc).is_empty() {
+            return Err(bad("file.save", "This version cannot preserve all parts of the newer design."));
+        }
+        let mut snapshot = self.scratch();
+        snapshot.path.clone_from(&self.path);
+        let prior_name = self.doc.name.clone();
+        if let Some(name) = saved_name(&prior_name, self.path.as_deref(), path, self.user_named) {
+            rename_design(&mut snapshot, &prior_name, &name);
+        }
+        let bytes = encode_unsigned_design(&snapshot, path, "container", solidcraft_io::DesignCompression::Fast, false, true)?;
+        account_design_size(&bytes, "file.save")?;
+        let provenance_chain = solidcraft_io::read_design_provenance_chain(&bytes);
+        let receipt = PreparedAccountSave {
+            document: self.uid,
+            save_generation: self.save_generation,
+            prior_path: self.path.clone(),
+            prior_name,
+            prior_saved: self.saved.clone(),
+            destination: path.to_string(),
+            design: snapshot.doc,
+            visibility: snapshot.visibility,
+            provenance_chain,
+        };
+        Ok((receipt, bytes))
+    }
+
+    /// Capture recovery bytes without taking a new design name or binding.
+    pub fn capture_account_draft(&self) -> Result<Vec<u8>> {
+        account_design_links(&self.doc, "file.save")?;
+        if self.moved_uncaptured() {
+            return Err(bad("file.save", "Capture or revert moved components before keeping a draft."));
+        }
+        let path = self.path.as_deref().unwrap_or("Untitled.sc");
+        let draft = encode_unsigned_design(self, path, "container", solidcraft_io::DesignCompression::Fast, false, false)?;
+        account_design_size(&draft, "file.save")?;
+        Ok(draft)
+    }
+
+    /// Open a self-contained design from bytes supplied by the account host.
+    pub fn open_account_design(path: Option<&str>, bytes: &[u8], recover: bool) -> Result<Self> {
+        if let Some(path) = path {
+            account_design_path(path, "doc.open")?;
+        } else if !recover {
+            return Err(bad("doc.open", "Choose an account design."));
+        }
+        account_design_size(bytes, "doc.open")?;
+        let mut design = solidcraft_io::read_design(bytes)?;
+        account_design_links(&design, "doc.open")?;
+        if let Some(name) = path.and_then(|path| default_name_for(&design.name, path)) {
+            design.name = name;
+        }
+        let mut session = Self::opened(design, None);
+        session.path = path.map(str::to_owned);
+        session.provenance_chain = solidcraft_io::read_design_provenance_chain(bytes);
+        if recover {
+            session.mark_unsaved();
+        }
+        Ok(session)
+    }
+
+    /// Adopt only the captured snapshot after the account server confirms the write.
+    pub fn adopt_account_save(&mut self, save: PreparedAccountSave) -> Result<()> {
+        if self.uid != save.document
+            || self.save_generation != save.save_generation
+            || self.path != save.prior_path
+            || !std::sync::Arc::ptr_eq(&self.saved, &save.prior_saved)
+        {
+            return Err(bad("file.save", "The confirmed account save belongs to a different design or save."));
+        }
+        if self.doc.name == save.prior_name && self.doc.name != save.design.name {
+            rename_design(self, &save.prior_name, &save.design.name);
+        }
+        self.path = Some(save.destination);
+        self.disk = None;
+        self.read_only = false;
+        self.provenance_chain = save.provenance_chain;
+        self.provenance = None;
+        self.save_generation = self.save_generation.wrapping_add(1);
+        self.saved = save.design;
+        self.saved_visibility = save.visibility;
+        self.forget_dirty_answer();
+        Ok(())
+    }
 }
 
 /// Write the container with one GnuPG-signed provenance record appended to the session's chain.
@@ -2129,6 +2274,7 @@ impl Session {
         self.provenance.clone_from(&done.provenance);
         self.saved = done.saved.clone();
         self.saved_visibility = done.saved_visibility.clone();
+        self.save_generation = self.save_generation.wrapping_add(1);
     }
 
     /// The design's file was renamed (browser OPFS rename, or an equivalent host move): keep the
@@ -2867,6 +3013,50 @@ mod urdf_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_receipt_confirms_only_the_written_parametric_part() {
+        fn volume(part: &mut Session) -> f64 {
+            part.execute("inspect.measure", &json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap()
+        }
+
+        let mut part = Session::default();
+        let sketch = part.execute("sketch.create", &json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+        part.execute("sketch.rectangle.two_point", &json!({"p0":[0,0],"p1":[10,10]})).unwrap();
+        part.execute("sketch.finish", &json!({})).unwrap();
+        let feature = part.execute("solid.extrude", &json!({"distance":5})).unwrap()["feature"].as_u64().unwrap();
+        let destination = "Documents/Plate.sc";
+        let (receipt, bytes) = part.prepare_account_save(destination).unwrap();
+        let (duplicate, _) = part.prepare_account_save(destination).unwrap();
+        assert!(part.is_dirty() && part.path.is_none());
+        assert!(part.prepare_account_save("../Plate.sc").is_err());
+        assert!(part.prepare_account_save("Documents/Plate.step").is_err());
+        part.execute(
+            "timeline.redefine",
+            &json!({"feature":feature,"command":"solid.extrude",
+            "params":{"sketch":sketch,"profiles":"all","distance":10,"operation":"new"}}),
+        )
+        .unwrap();
+        part.adopt_account_save(receipt).unwrap();
+        assert_eq!(part.path.as_deref(), Some(destination));
+        assert!(part.is_dirty());
+        assert!((volume(&mut part) - 1000.0).abs() < 1e-6);
+        assert!(part.adopt_account_save(duplicate).is_err());
+
+        let mut reopened = Session::open_account_design(Some(destination), &bytes, false).unwrap();
+        assert_eq!(reopened.path.as_deref(), Some(destination));
+        assert!(!reopened.is_dirty());
+        assert!((volume(&mut reopened) - 500.0).abs() < 1e-6);
+        assert!(Session::open_account_design(None, &bytes, false).is_err());
+        assert!(Session::open_account_design(Some("Documents/Plate.step"), &bytes, false).is_err());
+        let draft = part.capture_account_draft().unwrap();
+        let mut recovered = Session::open_account_design(Some(destination), &draft, true).unwrap();
+        assert!(recovered.is_dirty());
+        assert!((volume(&mut recovered) - 1000.0).abs() < 1e-6);
+        let (receipt, _) = part.prepare_account_save(destination).unwrap();
+        part.adopt_account_save(receipt).unwrap();
+        assert!(!part.is_dirty());
+    }
 
     /// #9449: a 3MF export carries a picture of the part as its package thumbnail.
     #[test]
