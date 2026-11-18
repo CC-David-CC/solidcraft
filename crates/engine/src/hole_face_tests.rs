@@ -600,11 +600,14 @@ fn a_hole_wider_than_the_part_says_it_removes_all_of_it() {
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "name": "Plate"}));
     run(&mut s, "solid.hole", json!({"position": [10, 10, 10], "diameter": "hd", "name": "H1"}));
     assert_eq!(said(&s, "H1"), "");
-    assert_eq!(s.model.state().bodies.len(), 1);
+    // The bore touches y = 30 along a line. The two remaining solids have no shared volume.
+    assert_eq!(s.model.state().bodies.len(), 2);
+    assert!((volume(&mut s) - 4031.9614).abs() < 1e-3, "{}", volume(&mut s));
     change(&mut s, "hd", "100 mm");
     assert!(s.model.state().bodies.is_empty());
     assert!(said(&s, "H1").contains("the hole removes all of Body1"), "{}", said(&s, "H1"));
     change(&mut s, "hd", "5 mm");
+    assert_eq!(s.model.state().bodies.len(), 1);
     assert_eq!(said(&s, "H1"), "");
 }
 
