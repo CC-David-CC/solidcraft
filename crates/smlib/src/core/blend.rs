@@ -11,13 +11,8 @@
 //! corners by point, and drives the executive step by step (`SetFilletParameters`,
 //! `CreateFilletCorners`, the corners' bevels and setbacks, `DoFilleting`, `StitchAndOrient`).
 //!
-//! What the capi asks of fork-only SMLib code that solidcore does not have is
-//! [`Error::Unsupported`], refused where the capi would first reach it, so every error before
-//! it is the C++ path's:
-//! - a variable radius whose law has a corner (`SplitFilletFacesAtRadiusCorners`, fork 6eecf04; solidcore#430, PR #1403).
-//!
-//! solidcore's own refusals of code it has not ported (`SolidError::Unported`) are
-//! [`Error::Unsupported`] too.
+//! The executive splits variable-radius faces at corners in their law. An unported kernel
+//! operation maps to [`Error::Unsupported`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::PoisonError;
@@ -1244,40 +1239,6 @@ fn law_pinches(degree: usize, knots: &[f64], radii: &[f64]) -> bool {
     false
 }
 
-/// Whether the law has a corner inside (0, 1) (`SmBSplineFilletLaw::GetCornerParameters`, fork
-/// 6eecf04): an interior knot where the radius' slope from the left and from the right differ by
-/// more than `SM_EFF_ZERO * (1 + |left| + |right|)`. The slope is the derivative B-spline's,
-/// `Q_i = p (r_{i+1} - r_i) / (u_{i+p+1} - u_{i+1})`; it jumps only at a knot repeated `m >= p`
-/// times, from `Q_{s-2}` to `Q_{s+m-1-p}` (`s` the knot's first index).
-fn law_has_corner(degree: usize, knots: &[f64], radii: &[f64]) -> bool {
-    const EFF_ZERO: f64 = 1e-12;
-    let p = degree;
-    let q = |i: usize| -> Option<f64> {
-        let (r0, r1) = (radii.get(i)?, radii.get(i + 1)?);
-        let span = knots.get(i + p + 1)? - knots.get(i + 1)?;
-        Some(p as f64 * (r1 - r0) / span)
-    };
-    let n = radii.len();
-    let mut s = p + 1;
-    while s < n {
-        let Some(&u) = knots.get(s) else { break };
-        let mut m = 1;
-        while knots.get(s + m) == Some(&u) {
-            m += 1;
-        }
-        if m >= p && u > 0.0 && u < 1.0 {
-            let (Some(left), Some(right)) = (s.checked_sub(2).and_then(q), q(s + m - 1 - p)) else {
-                return true;
-            };
-            if (left - right).abs() > EFF_ZERO * (1.0 + left.abs() + right.abs()) {
-                return true;
-            }
-        }
-        s += m;
-    }
-    false
-}
-
 /// `law_along`: the radius law along `e`, the B-spline with the radius as its x and its own
 /// parameter as its y (control points at the Greville abscissae), reversed when `start` is
 /// nearer the end of the edge's interval than its start. `None` where the capi's is null.
@@ -1350,11 +1311,6 @@ pub(crate) fn fillet_variable(
         let Some(law) = law_along(k, &w, e, start, degree, knots, radii)? else {
             return Ok(Err(Error::Status(INVALID_INPUT)));
         };
-        // A law with a corner splits the round's face there (`SplitFilletFacesAtRadiusCorners`,
-        // fork 6eecf04), which solidcore does not have.
-        if law_has_corner(degree, knots, radii) {
-            return Ok(Err(Error::Unsupported));
-        }
         // The round is the union of its balls (smlib#78, solidcore#2262):
         // each ball touches it along the circle shifted
         // -r r'/|c'| from its great circle. A law whose balls fold over one another is refused
@@ -1428,11 +1384,6 @@ mod tests {
         assert!(!law_ok(4, &[0.0; 7], &[1.0, 2.0]));
         assert!(law_pinches(1, &[0.0, 0.0, 0.5, 1.0, 1.0], &[1.0, 0.0, 1.0]));
         assert!(!law_pinches(1, &[0.0, 0.0, 1.0, 1.0], &[0.0, 1.0]));
-        // A straight law has no corner; a bent one does at its inner knot; a cubic none.
-        assert!(!law_has_corner(1, &[0.0, 0.0, 1.0, 1.0], &[1.0, 2.0]));
-        assert!(!law_has_corner(1, &[0.0, 0.0, 0.5, 1.0, 1.0], &[1.0, 1.5, 2.0]));
-        assert!(law_has_corner(1, &[0.0, 0.0, 0.5, 1.0, 1.0], &[1.0, 2.0, 1.0]));
-        assert!(!law_has_corner(3, &[0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0], &[1.0, 2.0, 1.0, 2.0, 1.0]));
     }
 
     #[test]
