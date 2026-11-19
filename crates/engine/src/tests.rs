@@ -5277,6 +5277,15 @@ fn fillet_fit_taper_closes_to_a_point() {
     let out = run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 15]], "radius": 16, "fit": "taper"}));
     let w = out["feature"].as_u64().and_then(|id| s.model.result(id)).and_then(|r| r.warning.clone()).unwrap_or_default();
     assert!(w.contains("on 1 of 1 edges, down to 0 mm"), "{w}");
+    let fitted = volume(&mut s);
+    assert!(fitted > 0.0 && fitted < tapering_plate_volume(0.0, true), "{fitted}");
+    let state = s.world_state().unwrap();
+    assert_eq!(state.bodies.len(), 1);
+    let body = &state.bodies[0].body;
+    let validity = body.validity();
+    assert!(validity.is_empty(), "{validity:?}");
+    let tip = [40.0, 0.0, 15.0];
+    assert!(body.record().vertices.iter().any(|v| v.point.iter().zip(tip).all(|(a, b)| (a - b).abs() < 1e-9)));
 }
 
 #[test]

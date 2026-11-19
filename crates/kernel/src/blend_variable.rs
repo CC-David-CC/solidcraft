@@ -443,22 +443,31 @@ pub fn taper(body: &Body, edge_at: Vec3, radius: f64) -> Result<Taper> {
 /// edge (in `edges`' order; None where the radius is constant).
 pub fn fillet_tapered(body: &Body, edges: &[Vec3], radius: f64) -> Result<(Body, Vec<Option<Taper>>)> {
     let _span = solidcraft_profile::span("kernel", "fillet_tapered");
-    let why = match crate::fillet(body, edges, radius) {
-        Err(KernelError::TooLarge(why)) => why,
-        other => return other.map(|b| (b, vec![None; edges.len()])),
-    };
-    let mut tapers = vec![None; edges.len()];
+    let mut tapers = Vec::new();
     let mut constant = Vec::new();
-    for (p, slot) in edges.iter().zip(tapers.iter_mut()) {
-        match crate::fillet(body, &[*p], radius) {
-            Ok(_) => constant.push(*p),
-            Err(KernelError::TooLarge(_)) => *slot = Some(taper(body, *p, radius)?),
-            Err(e) => return Err(e),
+    match (crate::fillet(body, edges, radius), edges) {
+        (Ok(b), _) => return Ok((b, vec![None; edges.len()])),
+        (Err(e @ KernelError::TooLarge(_)), _) => {
+            tapers.resize(edges.len(), None);
+            for (p, slot) in edges.iter().zip(tapers.iter_mut()) {
+                match crate::fillet(body, &[*p], radius) {
+                    Ok(_) => constant.push(*p),
+                    Err(KernelError::TooLarge(_)) => *slot = Some(taper(body, *p, radius)?),
+                    Err(e) => return Err(e),
+                }
+            }
+            // Each edge fits alone but not together: nothing to taper.
+            if tapers.iter().all(Option::is_none) {
+                return Err(e);
+            }
         }
-    }
-    // Each edge fits alone but not together: nothing to taper.
-    if tapers.iter().all(Option::is_none) {
-        return Err(KernelError::TooLarge(why));
+        (Err(e @ KernelError::Failed(_)), [p]) => {
+            // A constant fillet against a wall closing to a point can fail while building
+            // the corner. Only retry when the measured room actually closes at an endpoint.
+            let t = taper(body, *p, radius).ok().filter(|t| t.spline.radii.first() == Some(&0.0) || t.spline.radii.last() == Some(&0.0));
+            tapers.push(Some(t.ok_or(e)?));
+        }
+        (Err(e), _) => return Err(e),
     }
     // Each step's result carries its history over `[body]`.
     let counts = crate::record::counts(&[body]);
