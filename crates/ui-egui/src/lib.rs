@@ -1596,9 +1596,7 @@ impl SolveApp {
         // The rules below name registered ids; a command spelled in another case is the same
         // command (the engine runs it), so it meets the same rules.
         let id = solidcraft_engine::find_command(id).map_or(id, |spec| spec.id);
-        if self.account_design.is_some()
-            && matches!(id.to_ascii_lowercase().as_str(), "file.new" | "doc.open" | "doc.recover" | "file.save" | "file.save_as" | "document.import")
-        {
+        if self.account_design.is_some() && matches!(id, "file.new" | "doc.open" | "doc.recover" | "file.save" | "file.save_as" | "document.import") {
             return Err("Use the WebOS account window for design file operations.".into());
         }
         crate::plugins::sync_policy(self);

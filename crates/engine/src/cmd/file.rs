@@ -2011,7 +2011,21 @@ fn encode_design(
     }
     let bytes = if let Some(bytes) = signed_bytes {
         bytes
-    } else if !chain.records.is_empty() {
+    } else {
+        encode_unsigned_design(s, path, format, compression, preview, cache)?
+    };
+    Ok((bytes, signature, notes))
+}
+
+fn encode_unsigned_design(
+    s: &Session,
+    path: &str,
+    format: &str,
+    compression: solidcraft_io::DesignCompression,
+    preview: bool,
+    cache: bool,
+) -> Result<Vec<u8>> {
+    let bytes = if let Some(chain) = s.provenance_chain.as_ref().filter(|chain| !chain.records.is_empty()) {
         // A save without a key keeps the history it opened with, so the newest record is reported
         // as covering an earlier version instead of the chain being destroyed.
         if format != "container" {
@@ -2021,7 +2035,7 @@ fn encode_design(
             }
         } else {
             let save =
-                solidcraft_io::ProvenanceSave { source: None, chain: &chain, author: None, tool: Some("SolidCraft"), note: None, created: None };
+                solidcraft_io::ProvenanceSave { source: None, chain, author: None, tool: Some("SolidCraft"), note: None, created: None };
             s.design_container_signed(Some(path), compression, preview, cache, &save).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
         }
     } else {
@@ -2031,7 +2045,7 @@ fn encode_design(
             _ => return Err(bad("file.save", "format must be container or json")),
         }
     };
-    Ok((bytes, signature, notes))
+    Ok(bytes)
 }
 
 const ACCOUNT_DESIGN_BYTES: usize = 128 << 20;
@@ -2094,7 +2108,7 @@ impl Session {
         if let Some(name) = saved_name(&prior_name, self.path.as_deref(), path, self.user_named) {
             rename_design(&mut snapshot, &prior_name, &name);
         }
-        let (bytes, _, _) = encode_design(&snapshot, path, "container", solidcraft_io::DesignCompression::Fast, false, true, false, None)?;
+        let bytes = encode_unsigned_design(&snapshot, path, "container", solidcraft_io::DesignCompression::Fast, false, true)?;
         account_design_size(&bytes, "file.save")?;
         let provenance_chain = solidcraft_io::read_design_provenance_chain(&bytes);
         let receipt = PreparedAccountSave {
@@ -2118,7 +2132,7 @@ impl Session {
             return Err(bad("file.save", "Capture or revert moved components before keeping a draft."));
         }
         let path = self.path.as_deref().unwrap_or("Untitled.sc");
-        let (draft, _, _) = encode_design(self, path, "container", solidcraft_io::DesignCompression::Fast, false, false, false, None)?;
+        let draft = encode_unsigned_design(self, path, "container", solidcraft_io::DesignCompression::Fast, false, false)?;
         account_design_size(&draft, "file.save")?;
         Ok(draft)
     }
