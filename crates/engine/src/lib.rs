@@ -3151,6 +3151,24 @@ impl Session {
         self.model.prime(&evaluated.0);
     }
 
+    /// Build an in-memory design with its evaluated geometry for a browser worker.
+    #[cfg(target_arch = "wasm32")]
+    pub fn worker_model(&self) -> std::result::Result<Vec<u8>, String> {
+        let cache = self.model.saved(&self.doc).ok_or("The design has no evaluated geometry")?;
+        io::write_design_container_with_cache(&self.doc, io::DesignCompression::Fast, None, Some(&cache)).map_err(|error| error.to_string())
+    }
+
+    /// Offer a worker's geometry as a cache. The editor still owns the command and transaction.
+    #[cfg(target_arch = "wasm32")]
+    pub fn prime_worker_model(&mut self, bytes: &[u8]) -> std::result::Result<(), String> {
+        let mut reader = io::DesignContainerReader::new(std::io::Cursor::new(bytes)).map_err(|error| error.to_string())?;
+        let cache = reader.geometry().ok_or("The worker returned no compatible geometry cache")?;
+        let doc = reader.read_document().map_err(|error| error.to_string())?;
+        let model = Model::adopt(&doc, &cache).map_err(|error| error.to_string())?;
+        self.prime(&Evaluated(model));
+        Ok(())
+    }
+
     /// Stop offering what [`Session::prime`] offered.
     pub fn unprime(&mut self) {
         self.model.unprime();

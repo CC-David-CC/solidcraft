@@ -46,4 +46,5 @@ web-sys = { version = "0.3", features = [
     "Headers", "ReadableStream", "ReadableStreamDefaultReader",
     "BeforeUnloadEvent", "Event", "EventTarget", "KeyboardEvent", "Response", "FormData", "RequestInit", "MediaQueryList", "Gamepad", "Performance",
     "PointerEvent", "Node", "VisibilityState", "Touch", "TouchEvent", "TouchList", "Crypto", "MessageEvent",
+    "ErrorEvent", "Worker", "WorkerOptions", "WorkerType",
 ] }

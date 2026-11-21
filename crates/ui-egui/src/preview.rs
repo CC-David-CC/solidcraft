@@ -190,6 +190,8 @@ pub struct PreviewState {
     /// Key of the commands whose result (or error) is shown.
     shown_key: Option<u64>,
     running: Option<(u64, Receiver<Job>)>,
+    #[cfg(target_arch = "wasm32")]
+    fillet_worker: Option<crate::dialogs::FilletTask>,
     /// Asks the running job to stop between features once it is obsolete.
     running_progress: Option<Arc<Progress>>,
     /// Jobs left behind for inputs that changed to another setup (#7167): asked to stop, their
@@ -491,6 +493,13 @@ impl PreviewState {
     }
 
     fn poll_at(&mut self, key: u64, stream_key: Option<u64>, now: f64) {
+        // A browser fillet worker can be terminated immediately. Start the current
+        // preview without waiting for geometry computed for superseded inputs.
+        #[cfg(target_arch = "wasm32")]
+        if self.fillet_worker.is_some() && self.running.as_ref().is_some_and(|(running, _)| *running != key) {
+            self.detach();
+        }
+
         if self.shown_key != Some(key) {
             self.sketches.clear();
             self.error = None;
@@ -507,6 +516,10 @@ impl PreviewState {
             };
             if let Some(job) = job {
                 self.running = None;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.fillet_worker = None;
+                }
                 let good = matches!(&job, Ok(b) if b.error.is_none());
                 let intermediate = good && (self.running_tool || stream_key.is_some() && self.running_stream_key == stream_key);
                 self.running_stream_key = None;
@@ -542,6 +555,10 @@ impl PreviewState {
     /// detached jobs until its thread ends (also when a closed dialog or another design leaves it
     /// behind, so `DETACHED` bounds what runs).
     fn detach(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.fillet_worker = None;
+        }
         if let Some(progress) = self.running_progress.take() {
             progress.cancel();
         }
@@ -639,6 +656,15 @@ fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     crate::control_joint_drive::expire(app);
+    // A preview waits while Apply owns the computation. The last drawn scene stays available.
+    #[cfg(target_arch = "wasm32")]
+    if app.applying.is_some() {
+        if app.preview.fillet_worker.is_some() {
+            app.preview.detach();
+        }
+        app.preview.busy = false;
+        return;
+    }
     if app.control_joint_drive.active() || !crate::ui_kit::numeric_preview_ready(ctx) {
         return;
     }
@@ -718,7 +744,7 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
         if let Some((_, id, _)) = &plugin {
             crate::plugin_menu::dry_run(&mut scratch, id);
         }
-        spawn(&mut app.preview, key, scratch, cmds, colors, tool, Arc::new(Progress::default()));
+        spawn(app, key, scratch, cmds, colors, tool);
     }
     app.preview.busy = app.preview.running.is_some();
     // Both worker results and the web's synchronous results are ready before their first draw.
@@ -747,7 +773,9 @@ fn job_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> u64 {
 
 /// Start computing the preview of `cmds`: for a tool feature (`tool`), only its tool.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, progress: Arc<Progress>) {
+fn spawn(app: &mut SolveApp, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
+    let pv = &mut app.preview;
+    let progress = Arc::new(Progress::default());
     let (tx, rx) = std::sync::mpsc::channel();
     // Watched by `progress`, so a job left behind for other inputs skips its remaining features.
     let watched = progress.clone();
@@ -769,10 +797,44 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
     }
 }
 
-/// No threads on the web: compute right away.
+/// Use the editor's preview builder with the geometry evaluated by the browser Worker.
 #[cfg(target_arch = "wasm32")]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, _progress: Arc<Progress>) {
-    pv.apply(key, if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
+fn spawn_fillet(
+    pv: &mut PreviewState, worker: &crate::dialogs::ComputeFillet, key: u64, mut scratch: Session, cmds: Vec<(String, Value)>,
+    params: Value, colors: Colors,
+) {
+    let (send, done) = std::sync::mpsc::channel();
+    let launch = scratch.worker_model().and_then(|request| {
+        worker(
+            request,
+            params,
+            Box::new(move |response| {
+                let result = response.and_then(|bytes| {
+                    scratch.prime_worker_model(&bytes)?;
+                    compute(&scratch, &cmds, colors)
+                });
+                let _ = send.send(result);
+            }),
+        )
+    });
+    match launch {
+        Ok(task) => {
+            pv.running = Some((key, done));
+            pv.fillet_worker = Some(task);
+        }
+        Err(error) => pv.apply(key, Err(error)),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn(app: &mut SolveApp, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
+    let fillet = app.dialog.as_ref().and_then(|dialog| crate::dialogs::browser_fillet_parameters(app, dialog, &cmds)).cloned();
+    let pv = &mut app.preview;
+    if let (Some(worker), Some(params)) = (app.services.compute_fillet.as_ref(), fillet) {
+        spawn_fillet(pv, worker, key, scratch, cmds, params, colors);
+    } else {
+        pv.apply(key, if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
+    }
 }
 
 /// Evaluate the commands on the scratch session and build the preview scene.

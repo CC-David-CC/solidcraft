@@ -717,6 +717,8 @@ pub struct Applying {
     pub(crate) cmds: Vec<(String, Value)>,
     pub(crate) progress: std::sync::Arc<solidcraft_engine::doc::progress::Progress>,
     pub(crate) quality: solidcraft_engine::doc::display_quality::DisplayQuality,
+    #[cfg(target_arch = "wasm32")]
+    _worker: Option<FilletTask>,
 }
 
 impl Applying {
@@ -817,8 +819,81 @@ fn warm_applying(_app: &SolveApp, _prepared: solidcraft_engine::ComputedCommands
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn begin_applying(_app: &SolveApp, _d: &Dialog) -> Option<Applying> {
-    None
+pub type FilletResult = Box<dyn FnOnce(Result<Vec<u8>, String>)>;
+
+#[cfg(target_arch = "wasm32")]
+pub type ComputeFillet = Box<dyn Fn(Vec<u8>, Value, FilletResult) -> Result<FilletTask, String>>;
+
+/// The owner dropping a fillet calculation releases its worker and its callbacks.
+#[cfg(target_arch = "wasm32")]
+pub struct FilletTask(Option<Box<dyn FnOnce()>>);
+
+#[cfg(target_arch = "wasm32")]
+impl FilletTask {
+    pub fn new(stop: impl FnOnce() + 'static) -> Self {
+        Self(Some(Box::new(stop)))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for FilletTask {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            stop();
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn browser_fillet_parameters<'a>(app: &SolveApp, d: &Dialog, cmds: &'a [(String, Value)]) -> Option<&'a Value> {
+    if !matches!(d.kind, Kind::Fillet { chamfer: false, .. })
+        || d.editing.is_some()
+        || app.session.doc.marker.is_some()
+        || app.session.active_component != 0
+        || !app.session.pending_moves.is_empty()
+        || app.session.active_sketch.is_some()
+    {
+        return None;
+    }
+    let [(command, params)] = cmds else { return None };
+    (command == "solid.fillet" && params.get("type").and_then(Value::as_str) == Some("curvature")).then_some(params)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn begin_applying(app: &SolveApp, d: &Dialog) -> Option<Applying> {
+    let worker = app.services.compute_fillet.as_ref()?;
+    let mut computation = DialogComputation::new(app, d).ok()?;
+    let params = browser_fillet_parameters(app, d, &computation.cmds)?.clone();
+    let cmds = computation.cmds.clone();
+    let started = crate::now_ms();
+    let (send, done) = std::sync::mpsc::channel();
+    let launch = computation.session.worker_model().and_then(|request| {
+        worker(
+            request,
+            params,
+            Box::new(move |response| {
+                let result = response.and_then(|bytes| {
+                    computation.session.prime_worker_model(&bytes)?;
+                    computation.compute()
+                });
+                let _ = send.send(result);
+            }),
+        )
+    });
+    let (worker, ready) = match launch {
+        Ok(task) => (Some(task), None),
+        Err(error) => (None, Some(Err(error))),
+    };
+    Some(Applying {
+        done,
+        ready,
+        seen: false,
+        started,
+        cmds,
+        progress: Default::default(),
+        quality: display_quality(app),
+        _worker: worker,
+    })
 }
 
 /// The commands a dialog's inputs make (or why they make none), its picks, and the design's

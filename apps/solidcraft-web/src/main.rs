@@ -20,6 +20,8 @@ mod disk;
 #[cfg(target_arch = "wasm32")]
 mod easyprint;
 #[cfg(target_arch = "wasm32")]
+mod fillet;
+#[cfg(target_arch = "wasm32")]
 mod files;
 #[cfg(target_arch = "wasm32")]
 mod install;
@@ -1474,6 +1476,7 @@ mod web {
                             port.wake_on(cc.egui_ctx.clone());
                             let view = AccountView::new(port);
                             app.account_design = Some(view.design_service());
+                            app.services.compute_fillet = Some(crate::fillet::service(&cc.egui_ctx, &window));
                             view
                         });
                         let api = if launch.account {
@@ -1586,7 +1589,9 @@ mod web {
 fn main() {
     // The kernel's fix set, named to solidcore-ops before any call runs on it.
     solidcraft_engine::kernel::start();
-    web::start();
+    if web_sys::window().is_some() {
+        web::start();
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

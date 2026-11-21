@@ -535,6 +535,9 @@ pub type AccountDesignFn = Box<dyn Fn(AccountDesignRequest) -> Result<(), String
 /// Host services injected by the app so this crate stays portable.
 #[derive(Default)]
 pub struct Services {
+    /// Start an isolated fillet calculation for the browser's design dialog.
+    #[cfg(target_arch = "wasm32")]
+    pub compute_fillet: Option<dialogs::ComputeFillet>,
     /// Ask for a file to open. The extensions are the file type the command reads, offered as
     /// the picker's first filter (`&[]`: designs, CAD files and meshes, #1801).
     pub pick_open: Option<Box<dyn Fn(&[&str]) -> FilePickerFuture>>,
