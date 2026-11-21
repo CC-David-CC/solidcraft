@@ -493,6 +493,18 @@ pub fn calculate_tight_bounding_box_into(
     f: FaceId,
     out: &mut Extent3d,
 ) -> Result<()> {
+    expand_tight_bounding_box(k, lb, f, None, out)
+}
+
+/// While accumulating a whole body's box, the other faces and edges can already
+/// establish extrema beyond this face. Only search for extrema that enlarge it.
+pub(crate) fn expand_tight_bounding_box(
+    k: &Kernel,
+    lb: &mut LazyBrep<'_>,
+    f: FaceId,
+    body_bounds: Option<&Extent3d>,
+    out: &mut Extent3d,
+) -> Result<()> {
     let b = lb.get();
     // HANG-29: refuse coordinates the point classifications below cannot handle
     check_face_coordinates(k, b, f, OP_TIGHT)?;
@@ -575,6 +587,9 @@ pub fn calculate_tight_bounding_box_into(
         return Ok(());
     }
 
+    if let Some(bounds) = body_bounds {
+        face_bbox = face_bbox.union(bounds);
+    }
     // Set output to what we have so far.
     *out = face_bbox;
 

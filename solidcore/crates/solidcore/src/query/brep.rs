@@ -291,7 +291,7 @@ pub fn calculate_tight_bounding_box<'a>(
         if face_bbox.is_contained_by(&brep_bbox, 0.0) {
             continue;
         }
-        qf3::calculate_tight_bounding_box_into(k, &mut lb, f, &mut face_bbox)?;
+        qf3::expand_tight_bounding_box(k, &mut lb, f, Some(&brep_bbox), &mut face_bbox)?;
         brep_bbox = brep_bbox.union(&face_bbox);
     }
 
