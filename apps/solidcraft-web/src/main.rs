@@ -20,9 +20,9 @@ mod disk;
 #[cfg(target_arch = "wasm32")]
 mod easyprint;
 #[cfg(target_arch = "wasm32")]
-mod fillet;
-#[cfg(target_arch = "wasm32")]
 mod files;
+#[cfg(target_arch = "wasm32")]
+mod fillet;
 #[cfg(target_arch = "wasm32")]
 mod install;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -1472,11 +1472,11 @@ mod web {
                         // Thumbnails of saves and start-page cards.
                         solidcraft_ui_egui::gpu::install_cpu_picture_renderer();
                         let mut app = SolveApp::new(session, services);
+                        app.services.compute_fillet = Some(crate::fillet::service(&cc.egui_ctx, &window));
                         let account = app_port.map(|port| {
                             port.wake_on(cc.egui_ctx.clone());
                             let view = AccountView::new(port);
                             app.account_design = Some(view.design_service());
-                            app.services.compute_fillet = Some(crate::fillet::service(&cc.egui_ctx, &window));
                             view
                         });
                         let api = if launch.account {

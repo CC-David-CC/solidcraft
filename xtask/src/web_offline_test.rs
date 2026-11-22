@@ -414,6 +414,33 @@ const API_TEST: &str = r#"(async () => {
     check((await app.inspect()).bodies[0].name === 'Browser API box', 'source design is active');
     await app.request('ui.documents', {action: 'switch', index: 0});
     check((await app.execute('component.links')).links[0].component === linked.component, 'assembly remains in its tab');
+    // An explicit curvature fillet from the standalone API uses a real browser worker.
+    await app.request('ui.documents', {action: 'new'});
+    await app.execute('solid.box', {length: 40, width: 10, height: 15, corner: [0, -5, 0], body_name: 'Block'});
+    await app.execute('solid.cylinder', {radius: 10, height: 30, base: [0, 0, 0], operation: 'join', targets: ['Block']});
+    const unrounded = (await app.inspect({measure: true})).bodies[0];
+    const RealWorker = window.Worker;
+    let filletWorkerRan = false;
+    window.Worker = new Proxy(RealWorker, {construct(target, args) {
+        const worker = Reflect.construct(target, args);
+        if (new URL(args[0], document.baseURI).pathname.endsWith('/fillet-worker.mjs')) {
+            worker.addEventListener('message', e => { filletWorkerRan = e.data instanceof Uint8Array && e.data.length > 0; });
+        }
+        return worker;
+    }});
+    try {
+        await app.execute('solid.fillet', {edges: [[30, 5, 15]], radius: 2, type: 'curvature'});
+    } finally {
+        window.Worker = RealWorker;
+    }
+    const rounded = (await app.inspect({measure: true})).bodies[0];
+    check(filletWorkerRan && rounded.closed && rounded.faces === 8 && rounded.volume_mm3 < unrounded.volume_mm3,
+        'standalone fillet worker returns a closed filleted body');
+    await app.execute('edit.undo');
+    check((await app.inspect({measure: true})).bodies[0].volume_mm3 === unrounded.volume_mm3, 'fillet undo restores the original solid');
+    await app.execute('edit.redo');
+    check((await app.inspect({measure: true})).bodies[0].volume_mm3 === rounded.volume_mm3, 'fillet redo restores the rounded solid');
+    await app.request('ui.documents', {action: 'switch', index: 0});
     return {commands: 'discovered', bodies: [0, 1, 0, 1], errors: 'rejected', queue: '256 completed, 1 rejected',
         dxf: 'omit and dashed exported; dialog download checked', linked: 'source opened from browser storage',
         host: 'exported, saved and imported back'};

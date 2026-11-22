@@ -9,6 +9,14 @@ use solidcraft_ui_egui::dialogs::{ComputeFillet, FilletResult, FilletTask};
 use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{ErrorEvent, MessageEvent, Window, Worker, WorkerOptions, WorkerType};
 
+// Trunk fingerprints the bindings; WebOS uses a stable filename. Give the worker
+// the very same bindings URL the active editor used for its compiled module.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(thread_local_v2, js_namespace = ["import", "meta"], js_name = url)]
+    static BINDINGS_URL: JsValue;
+}
+
 fn calculate(bytes: &[u8], parameters: &str) -> Result<Vec<u8>, String> {
     let params: Value = serde_json::from_str(parameters).map_err(|error| error.to_string())?;
     if params.get("type").and_then(Value::as_str) != Some("curvature") {
@@ -66,7 +74,7 @@ pub(crate) fn service(ctx: &egui::Context, window: &Window) -> ComputeFillet {
         worker.set_onmessage(Some(receive.as_ref().unchecked_ref()));
         worker.set_onerror(Some(failed.as_ref().unchecked_ref()));
         let data = Uint8Array::from(bytes.as_slice());
-        let request = Array::of3(data.as_ref(), &JsValue::from_str(&params.to_string()), &wasm_bindgen::module());
+        let request = BINDINGS_URL.with(|url| Array::of4(data.as_ref(), &JsValue::from_str(&params.to_string()), &wasm_bindgen::module(), url));
         let transfer = Array::of1(data.buffer().as_ref());
         let timer = window
             .set_timeout_with_callback_and_timeout_and_arguments_0(expired.as_ref().unchecked_ref(), 120_000)

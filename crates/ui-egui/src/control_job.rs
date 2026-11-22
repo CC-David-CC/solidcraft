@@ -225,6 +225,16 @@ enum Work {
     /// Evaluated ahead: once in, the request runs here. `doc` and `revision` are the design it
     /// was computed for.
     Ahead { commands: Vec<(String, Value)>, doc: Arc<solidcraft_engine::doc::Document>, revision: u64, tries: u8, kept: Arc<KeptResults> },
+    /// The Wasm worker returns geometry only. The original request still runs on the live session.
+    #[cfg(target_arch = "wasm32")]
+    BrowserFillet {
+        uid: u64,
+        doc: Arc<solidcraft_engine::doc::Document>,
+        revision: u64,
+        tries: u8,
+        geometry: Receiver<Result<Vec<u8>, String>>,
+        _task: Option<crate::dialogs::FilletTask>,
+    },
     /// Run on a copy; the reply comes from there.
     Answer { inspection: Option<(u64, usize)> },
     /// External code executes once on its worker. Stale/cancelled results are discarded.
@@ -573,6 +583,55 @@ impl SolveApp {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn browser_fillet(&self, req: &ControlRequest, tries: u8) -> Option<(Work, Receiver<Option<Value>>)> {
+        let worker = self.services.compute_fillet.as_ref()?;
+        if !self.preferences.agent_off_thread
+            || !matches!(req.method.as_str(), "engine.execute" | "command")
+            || self.file_load_holds()
+            || self.file_picker.is_some()
+        {
+            return None;
+        }
+        let (command, mut params) = executed(&req.params)?;
+        let style = params.get("type")?.as_str()?;
+        let session = &self.session;
+        // A serialized design has no live selection, in-progress move, sketch or edit context.
+        // Explicit edge picks at the root of a finished design have the same meaning on its copy.
+        if spec_id(command) != Some("solid.fillet")
+            || !(style.eq_ignore_ascii_case("curvature") || style.eq_ignore_ascii_case("g2"))
+            || !params.get("edges").and_then(Value::as_array).is_some_and(|edges| !edges.is_empty())
+            || session.doc.marker.is_some()
+            || session.active_component != 0
+            || session.active_sketch.is_some()
+            || !session.pending_moves.is_empty()
+        {
+            return None;
+        }
+        crate::control::request_scope(self, &req.params).ok()?;
+        crate::control::request_param_check(&req.method, &req.params).ok()?;
+        params["type"] = json!("curvature");
+        let (send, geometry) = std::sync::mpsc::channel();
+        let (notify, done) = std::sync::mpsc::channel();
+        let finished = {
+            let send = send.clone();
+            let notify = notify.clone();
+            Box::new(move |value| {
+                let _ = send.send(value);
+                let _ = notify.send(None);
+            })
+        };
+        let task = match session.worker_model().and_then(|bytes| worker(bytes, params, finished)) {
+            Ok(task) => Some(task),
+            Err(error) => {
+                let _ = send.send(Err(error));
+                let _ = notify.send(None);
+                None
+            }
+        };
+        Some((Work::BrowserFillet { uid: session.uid, doc: session.doc.clone(), revision: session.revision, tries, geometry, _task: task }, done))
+    }
+
     /// Take a control request off the window thread when it computes long (see the module
     /// notes). Returns it when it should simply run here now.
     pub(crate) fn offload_control(&mut self, ctx: &egui::Context, req: ControlRequest) -> Option<ControlRequest> {
@@ -641,6 +700,13 @@ impl SolveApp {
                 started: crate::now_ms(),
                 steps: None,
             });
+            return None;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some((work, done)) = self.browser_fillet(&req, 0) {
+            req.ticket.computing(false);
+            self.control_job = Some(ControlJob { label: label(self, "solid.fillet"), req, work, done, started: crate::now_ms(), steps: None });
+            ctx.request_repaint();
             return None;
         }
         if self.apply_off_thread.is_none() || self.file_load_holds() || self.file_picker.is_some() {
@@ -812,6 +878,8 @@ impl SolveApp {
         // refused now, however long its computation has left, so the requests behind it, which
         // are for the design shown, don't wait for it.
         let left = matches!(&job.work, Work::Ahead { doc, .. } if !shows_design(&self.session, doc));
+        #[cfg(target_arch = "wasm32")]
+        let left = left || matches!(&job.work, Work::BrowserFillet { uid, doc, .. } if self.session.uid != *uid || !shows_design(&self.session, doc));
         if left {
             if let Some(job) = self.control_job.take() {
                 let _ = job.req.reply.send(design_replaced(&job.label));
@@ -892,6 +960,40 @@ impl SolveApp {
         // Cancelled by its client while it computed (requests behind it go on).
         if !job.req.ticket.back() {
             let _ = job.req.reply.send(stopped_reply(&job.label, false));
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Work::BrowserFillet { uid, ref doc, revision, tries, ref geometry, .. } = job.work {
+            if uid != self.session.uid || !shows_design(&self.session, doc) {
+                let _ = job.req.reply.send(design_replaced(&job.label));
+                return;
+            }
+            if !Arc::ptr_eq(doc, &self.session.doc) || revision != self.session.revision {
+                if tries < MAX_TRIES
+                    && let Some((work, done)) = self.browser_fillet(&job.req, tries + 1)
+                {
+                    job.req.ticket.computing(false);
+                    self.control_job = Some(ControlJob { work, done, ..job });
+                } else {
+                    let _ = job
+                        .req
+                        .reply
+                        .send(json!({"ok": false, "error": "The design changed while the fillet was computing. Run the command again."}));
+                }
+                return;
+            }
+            let cached = geometry
+                .try_recv()
+                .map_err(|_| "The fillet worker returned no geometry".to_string())
+                .and_then(|result| result)
+                .and_then(|bytes| self.session.prime_worker_model(&bytes));
+            if let Err(error) = cached {
+                let _ = job.req.reply.send(json!({"ok":false, "error":error}));
+                return;
+            }
+            self.big_operation |= crate::now_ms() - job.started >= crate::recovery_ui::BIG_OPERATION_MS;
+            self.run_control(ctx, job.req);
+            self.session.unprime();
             return;
         }
         let Work::Ahead { commands, doc, revision, tries, kept } = job.work else { return };

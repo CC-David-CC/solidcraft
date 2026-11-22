@@ -744,7 +744,10 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
         if let Some((_, id, _)) = &plugin {
             crate::plugin_menu::dry_run(&mut scratch, id);
         }
+        #[cfg(target_arch = "wasm32")]
         spawn(app, key, scratch, cmds, colors, tool);
+        #[cfg(not(target_arch = "wasm32"))]
+        spawn(&mut app.preview, key, scratch, cmds, colors, tool, Arc::new(Progress::default()));
     }
     app.preview.busy = app.preview.running.is_some();
     // Both worker results and the web's synchronous results are ready before their first draw.
@@ -773,9 +776,7 @@ fn job_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> u64 {
 
 /// Start computing the preview of `cmds`: for a tool feature (`tool`), only its tool.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn(app: &mut SolveApp, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
-    let pv = &mut app.preview;
-    let progress = Arc::new(Progress::default());
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, progress: Arc<Progress>) {
     let (tx, rx) = std::sync::mpsc::channel();
     // Watched by `progress`, so a job left behind for other inputs skips its remaining features.
     let watched = progress.clone();
